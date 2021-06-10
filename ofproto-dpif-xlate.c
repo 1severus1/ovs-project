@@ -5593,13 +5593,13 @@ static void
          * if only one packet was aggregated, log to file as non-aggregatable
          * remove code below so that no log file is created
         */
-        if(args->dict_entry->dp_packet_buff1[1].packet == 0)
+        /*if(args->dict_entry->dp_packet_buff1[1].packet == 0)
         {
             udp_log_count++;
             logfile = fopen("/root/ovs/Aggregationstats.txt", "a+");
             fprintf(logfile, "aggregated only 1 udp packet! total times udp didn't aggregate or aggregated only one packet: %d \n", udp_log_count);
             fclose(logfile);
-        }
+        }*/
         args->dict_entry->index = 0;
         struct eth_addr fake_mac = ETH_ADDR_C(12, 34, 56, 78, 9a, bc); //fake mac to distinguish Packet Aggregate
         //do stuff as if buffer were full
