@@ -7,4 +7,6 @@ With the help by OVS mailinglist, we add our custom actions by coding in
 ./openvswitch-2.14.0/lib/ofp-actions.c
 ./openvswitch-2.14.0/ofproto/ofproto-dpif-xlate.c
 
-You can directly see these three files in ovs-
+You can directly see these three files in ovs-project folder.
+
+You can compile in openvswitch-2.14.0 folder with these three files already in.
