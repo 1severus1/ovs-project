@@ -9,4 +9,7 @@ With the help by OVS mailinglist, we add our custom actions by coding in
 
 You can directly see these three files in ovs-project folder.
 
-You can compile in openvswitch-2.14.0 folder with these three files already in.
+Please download the source code of openvswitch-2.14.0 in [OVS downloading page](http://www.openvswitch.org/download/).
+
+And change these three files above before compile.
+
