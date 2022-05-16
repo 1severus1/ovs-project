@@ -5268,15 +5268,17 @@ xlate_output_action(struct xlate_ctx *ctx, ofp_port_t port,
         ctx->nf_output_iface = NF_OUT_MULTI;
     }
 }
-#define PACKET_BUFF_ELEMENTS 2 //each dp_packet buffer contains this amount of packets, just modify this all should work fine
+#define PACKET_BUFF_ELEMENTS 1 //each dp_packet buffer contains this amount of packets, just modify this all should work fine
 #define FLOWS_TO_HOLD 1000 //pseudo-dictionary for aggregation, since we need flow_id to distinguish which flow we're working on , honestly 1000 flows is overkill
-#define TIMER_THREAD 100 //amount of milliseconds we want the timer for each thread, started after first flow for aggregation is received, to last (e.g 8 seconds-->8000)
-#define TIMER_THREAD_TCP 100
-static int index_for_dict = 0; //this value is used to iterate over our pseudo dictionary
-static int flows_in_dict = 0; //this value is used to check how many flow_ids are stored at a given time
+#define TIMER_THREAD 50 //amount of milliseconds we want the timer for each thread, started after first flow for aggregation is received, to last (e.g 8 seconds-->8000)
+#define TIMER_THREAD_TCP 20
 
-static int index_for_dict_tcp = 0; //this value is used to iterate over our pseudo dictionary
-static int flows_in_dict_tcp = 0; //this value is used to check how many flow_ids are stored at a given time
+uint32_t buffer_unique_id=0;
+int index_for_dict = 0; //this value is used to iterate over our pseudo dictionary
+int flows_in_dict = 0; //this value is used to check how many flow_ids are stored at a given time
+
+int index_for_dict_tcp = 0; //this value is used to iterate over our pseudo dictionary
+int flows_in_dict_tcp = 0; //this value is used to check how many flow_ids are stored at a given time
 
 //stats
 static FILE *logfile;
@@ -5289,7 +5291,7 @@ static int tcp_log_count = 0;
 struct my_captured_packet
 {
     struct dp_packet *packet;
-    int sizeofpayload;
+    uint32_t sizeofpayload;
 
 
 };
@@ -5299,6 +5301,20 @@ struct my_captured_packet_tcp
     uint32_t sizeoftcppayload;
 
 };
+struct deaggr_buffer{
+    uint32_t flag;
+    uint32_t flow_id;
+    uint32_t buffer_id;
+    uint32_t tar_len;
+    uint32_t cur_len;
+    char* pk_data;
+    char* pk_temp[20];
+    uint32_t pk_len[20];
+    uint32_t num_part;
+    pthread_mutex_t mt;
+};
+
+struct deaggr_buffer flow_deaggr_dict_tcp[100];
 /*
  * args_for_thread holds all arguments we need to pass to the single threads that are started for each flow, specifically
  * @timerstop (idk how useful this is) holds boolean to check whether the timer is finished or not, only used in if statements as an overkill additional check i guess
@@ -5344,6 +5360,7 @@ struct flow_dict
     int flow_id;
     struct my_captured_packet dp_packet_buff1[PACKET_BUFF_ELEMENTS]; //= {{0}}; //initialized to 0 so can check for all packets when buffer isn't full
     int index;
+    unsigned int filling_size;
     struct args_for_thread argsForThread;
     pthread_t tid;
 };
@@ -5353,9 +5370,13 @@ struct flow_dict_tcp
     int flow_id;
     struct my_captured_packet_tcp dp_packet_buff1[PACKET_BUFF_ELEMENTS]; //= {{0}}; //initialized to 0 so can check for all packets when buffer isn't full
     int index;
+    //unsigned int filling_size;
+    pthread_mutex_t mt;
     struct args_for_thread_tcp argsForThread;
     pthread_t tid;
 };
+
+
 
 /*
     clean heap buffer created since we cannot use free()
@@ -5459,7 +5480,7 @@ create_custom_packet_aggr(struct dp_packet *temp_pkt_for_flow, struct my_capture
     int num_in_buffer=0;
     int total_buffer_size=0;
     struct my_captured_packet tempdata=data[num_in_buffer];
-    while(tempdata.packet!=NULL){
+    while(num_in_buffer<PACKET_BUFF_ELEMENTS&&tempdata.packet!=NULL){
         total_buffer_size+=sizeof(struct dp_packet);
         total_buffer_size+=tempdata.packet->allocated_;
         num_in_buffer++;
@@ -5475,15 +5496,15 @@ create_custom_packet_aggr(struct dp_packet *temp_pkt_for_flow, struct my_capture
 
         char* output_test=(char*)malloc(data[i].packet->allocated_);
         memcpy(output_test,databuffer+offset_buffer+sizeof(struct dp_packet),data[i].packet->allocated_);
-        VLOG_ERR("The one of payloads of sending aggr pk is %s",output_test);
+        //VLOG_ERR("The one of payloads of sending aggr pk is %s",output_test);
         int a=sizeof(struct dp_packet);
         int b=data[i].packet->allocated_;
-        VLOG_ERR("The size of one of sending aggr pk is %d+%d",a,b);
+        //VLOG_ERR("The size of one of sending aggr pk is %d+%d",a,b);
         free(output_test);
 
         offset_buffer+=(sizeof(struct dp_packet)+data[i].packet->allocated_);
     }
-    VLOG_ERR("The size of payload of sending aggr pk is %d",total_buffer_size);
+    //VLOG_ERR("The size of payload of sending aggr pk is %d",total_buffer_size);
 
 
 
@@ -5497,47 +5518,112 @@ create_custom_packet_aggr(struct dp_packet *temp_pkt_for_flow, struct my_capture
     return packetAggr;
 
 }
-static struct dp_packet*
-create_custom_packet_aggr_tcp(struct dp_packet *temp_pkt_for_flow, struct my_captured_packet_tcp *data, char** databuffer_p)
+static struct dp_packet**
+create_custom_packet_aggr_tcp(uint32_t* nums_splitted,struct dp_packet *temp_pkt_for_flow, struct my_captured_packet_tcp *data, char** databuffer_p)
 {
-    struct dp_packet *packetAggr;
-    packetAggr = dp_packet_new(1); //65535
 
     int num_in_buffer=0;
-    int total_buffer_size=0;
-    struct my_captured_packet_tcp tempdata=data[num_in_buffer];
-    while(tempdata.packet!=NULL){
-        total_buffer_size+=sizeof(struct dp_packet);
+    uint32_t total_buffer_size=0;
+    struct my_captured_packet_tcp tempdata;
+    //buffer structure: dp_packet* + payload
+    while(num_in_buffer<PACKET_BUFF_ELEMENTS){
+        tempdata=data[num_in_buffer];
+        if(tempdata.packet==NULL)break;
+        total_buffer_size+=sizeof(int32_t);
         total_buffer_size+=tempdata.packet->allocated_;
         num_in_buffer++;
-        tempdata=data[num_in_buffer];
     }
+    //VLOG_ERR("custom pk break point 1");
     *databuffer_p=(char*)malloc(total_buffer_size);
     char* databuffer=*databuffer_p;
     unsigned int offset_buffer=0;
-    for(int i=0;i<num_in_buffer;i++){
-        memcpy(databuffer+offset_buffer,data[i].packet,sizeof(struct dp_packet));
-        memcpy(databuffer+offset_buffer+sizeof(struct dp_packet),data[i].packet->base_,data[i].packet->allocated_);
-
-        char* output_test=(char*)malloc(data[i].packet->allocated_);
-        memcpy(output_test,databuffer+offset_buffer+sizeof(struct dp_packet),data[i].packet->allocated_);
-        VLOG_ERR("The one of payloads of sending aggr pk is %s",output_test);
-        int a=sizeof(struct dp_packet);
-        int b=data[i].packet->allocated_;
-        VLOG_ERR("The size of one of sending aggr pk is %d+%d",a,b);
-        free(output_test);
-
-        offset_buffer+=(sizeof(struct dp_packet)+data[i].packet->allocated_);
+    if(num_in_buffer>1){
+        FILE* f=NULL;
+        //VLOG_ERR("custom pk break point 1.5");
+        f=fopen("/media/sf_share/data/test/aggr_log.txt","a+");
+        fputs("successfully aggregated more than one pks\n",f);
+        fclose(f);
     }
-    VLOG_ERR("The size of payload of sending aggr pk is %d",total_buffer_size);
+    //VLOG_ERR("custom pk break point 2");
+    for(int i=0;i<num_in_buffer;i++){
+        //fill in buffer with dp_packet* and data
+        uint32_t pk_len=data[i].packet->allocated_;
+        memcpy(databuffer+offset_buffer,(char*)&pk_len,sizeof(uint32_t));
+        memcpy(databuffer+offset_buffer+sizeof(uint32_t),data[i].packet->base_,data[i].packet->allocated_);
+
+        //test the size
+        // char* output_test=(char*)malloc(sizeof(uint32_t));
+        // memcpy(output_test,databuffer+offset_buffer,sizeof(uint32_t));
+        int a=sizeof(uint32_t);
+        int b=data[i].packet->allocated_;
+        //VLOG_ERR("The size of one of sending tcp aggr pk is %d+%d",a,b);
+        // free(output_test);
+
+        offset_buffer+=(sizeof(uint32_t)+data[i].packet->allocated_);
+    }
+    VLOG_ERR("The size of total sending tcp aggr pk is -----%d----- and -----%d----- packets aggregated",total_buffer_size,num_in_buffer);
+
+    //if the size of buffer hit the MTU, split it into small pks
+    *nums_splitted=(total_buffer_size-1)/1400+1;
+    void* pks=malloc(sizeof(struct dp_packet*)*(*nums_splitted));
+    struct dp_packet* * packetAggr=(struct dp_packet* *)pks;
+
+    //VLOG_ERR("This tcp aggr pk is going to be split into %d parts",*nums_splitted);
+
+    uint32_t ofs_data=0;
+    uint32_t seqNum=1;
+    char* buffer_id_ptr=(char*)&buffer_unique_id;
+    for(int j=0;j<(*nums_splitted);j++){
+        packetAggr[j] = dp_packet_new(1); //65535
+        struct flow flow; //create flow structure to copy flow of one of buffered packets
+        flow_extract(temp_pkt_for_flow, &flow); //copy flow from temp_pkt_for_flow to build a new packet with the same flow
+
+        uint32_t len_single=total_buffer_size<1400?total_buffer_size:1400;
+        char* temp_data=NULL;
+        char* seqPtr=(char*)&seqNum;
+        char* lenPtr=(char*)&len_single;
+        if(j==0){
+            temp_data=(char*)malloc(sizeof(uint32_t)*4+len_single);
+            char* len_total=(char*)&total_buffer_size;
+            memcpy(temp_data,buffer_id_ptr,sizeof(uint32_t));
+            memcpy(temp_data+4,seqPtr,sizeof(uint32_t));
+            memcpy(temp_data+8,lenPtr,sizeof(uint32_t));
+            memcpy(temp_data+12,len_total,sizeof(uint32_t));
+            memcpy(temp_data+16,databuffer+ofs_data,len_single);
+            seqNum++;
+            ofs_data+=len_single;
+            total_buffer_size-=len_single;
+            VLOG_ERR("The payload size of NO.%d part is %d, with extro %d bytes contorl info and still remain %d bytes data",seqNum-1,len_single,16,total_buffer_size);
+
+            //use the flow to build a new packet with aggregation of packets as it's udp_paylaod
+            flow_compose(packetAggr[j], &flow, temp_data, len_single+16);
+        }
+        else{
+            temp_data=(char*)malloc(sizeof(uint32_t)*3+len_single);
+            memcpy(temp_data,buffer_id_ptr,sizeof(uint32_t));
+            memcpy(temp_data+4,seqPtr,sizeof(uint32_t));
+            memcpy(temp_data+8,lenPtr,sizeof(uint32_t));
+            memcpy(temp_data+12,databuffer+ofs_data,len_single);
+            seqNum++;
+            ofs_data+=len_single;
+            total_buffer_size-=len_single;
+            VLOG_ERR("The payload size of NO.%d part is %d, with extro %d bytes contorl info and still remain %d bytes data",seqNum-1,len_single,12,total_buffer_size);
+
+            //use the flow to build a new packet with aggregation of packets as it's udp_paylaod
+            flow_compose(packetAggr[j], &flow, temp_data, len_single+12);
+        }
+        
+        free(temp_data);
+    }
+    buffer_unique_id=(buffer_unique_id+1)%1000;
+
+    //free dp_packets
+    for(int i=0;i<num_in_buffer;i++){
+        dp_packet_delete(data[i].packet);
+    }
 
 
-    struct flow flow; //create flow structure to copy flow of one of buffered packets
-    flow_extract(temp_pkt_for_flow, &flow); //copy flow from temp_pkt_for_flow to build a new packet with the same flow
-
-    //use the flow to build a new packet with aggregation of packets as it's udp_paylaod
-    flow_compose(packetAggr, &flow, databuffer, total_buffer_size);
-
+    
     return packetAggr;
 
 }
@@ -5546,7 +5632,7 @@ create_custom_packet_aggr_tcp(struct dp_packet *temp_pkt_for_flow, struct my_cap
 /*
  * Timer function which returns after @milliseconds
  */
-static void
+void
 setTimeout(int milliseconds)
 {
     // If milliseconds is less or equal to 0
@@ -5577,6 +5663,10 @@ setTimeout(int milliseconds)
  * Thread started by aggregation action for each flow in dictionary
  * @arg containins struct args_for_thread, stuff needed to send packet aggregation if timer elapses
  */
+int times_aggr_send=0;
+int times_deaggr=0;
+int going_in_deaggr=0;
+
 static void
 *threadproc(void *arg)
 {
@@ -5591,15 +5681,15 @@ static void
     {
         /*
          * if only one packet was aggregated, log to file as non-aggregatable
-         * remove code below so that no log file is created
+         * 
         */
-        /*if(args->dict_entry->dp_packet_buff1[1].packet == 0)
+        if(args->dict_entry->dp_packet_buff1[1].packet == 0)
         {
             udp_log_count++;
             logfile = fopen("/root/ovs/Aggregationstats.txt", "a+");
             fprintf(logfile, "aggregated only 1 udp packet! total times udp didn't aggregate or aggregated only one packet: %d \n", udp_log_count);
             fclose(logfile);
-        }*/
+        }
         args->dict_entry->index = 0;
         struct eth_addr fake_mac = ETH_ADDR_C(12, 34, 56, 78, 9a, bc); //fake mac to distinguish Packet Aggregate
         //do stuff as if buffer were full
@@ -5623,10 +5713,14 @@ static void
         put_16aligned_be32(&netip, ip);
         iph->ip_dst = netip;
         //VLOG_ERR("Thread is sending packet aggregation...");
-
+        //VLOG_ERR("Going to send by thread since timeout");
         int err_send = send_pkt_to_port(u16_to_ofp(args->aggrs->port), args->ofproto, packetAggr);
-        if (err_send == 0) VLOG_ERR("Packet aggregation sent correctly by Thread!");
-        else VLOG_ERR("Error in packet aggregation delivery %d", err_send);
+        //VLOG_ERR("This Aggrpacket is send through: %s ",  ofp_dp_packet_to_string(packetAggr));
+        times_aggr_send++;
+        //VLOG_ERR("Now by thread, there has been %d sent aggr pks and %d have been deaggr",times_aggr_send,times_deaggr);
+
+        if (err_send != 0)// VLOG_ERR("Packet aggregation sent correctly by Thread!");
+        VLOG_ERR("Error in packet aggregation delivery %d", err_send);
 
         /* dictionary cleanup */
         clear_packetBuff(args->dict_entry->dp_packet_buff1);
@@ -5650,77 +5744,154 @@ static void
     return 0;
 
 }
+
+// static void *thread_test_proc(){
+//     sleep(0.01);
+//     VLOG_ERR("5");
+//     sleep(0.01);
+//     VLOG_ERR("4");
+//     sleep(0.01);
+//     VLOG_ERR("3");
+//     sleep(0.01);
+//     VLOG_ERR("2");
+//     sleep(0.01);
+//     VLOG_ERR("1");
+
+// }
+
+
 static void
-*threadproc_tcp(void *arg)
+*threadproc_tcp(void* arg)
 {
-    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL); //make this thread cancellable from main or another thread
-    sleep(0);
+
     struct args_for_thread_tcp *args = arg;
-
+    //VLOG_ERR("thread break point 1");
     setTimeout(TIMER_THREAD_TCP);
+    //sleep(0.05);
+    //VLOG_ERR("thread break point 1.5");
+    //VLOG_ERR("print tid %d",args->dict_entry->tid);
+    int flag=pthread_mutex_lock(&(args->dict_entry->mt));
+    if(flag!=0){
+        VLOG_ERR("thread mutex error with number %d",flag);
+    }
+    else{
+        VLOG_ERR("mutex has been locked by thread, going to send aggr buffer with index %d since timeout",args->flow_entry_index);
+    }
+    //VLOG_ERR("thread break point 1.7");
     args->timerstop = true;
-
+    //VLOG_ERR("thread break point 2");
     if(args->dict_entry->dp_packet_buff1[0].packet != 0 || args->dict_entry->dp_packet_buff1[0].packet != NULL)
     {
         /*
          * if only one packet was aggregated, log to file as non-aggregatable
          * remove code below so that no log file is created
         */
-        /*if(args->dict_entry->dp_packet_buff1[1].packet == 0)
-        {
-            tcp_log_count++;
-            logfile = fopen("/root/ovs/Aggregationstats.txt", "a+");
-            fprintf(logfile, "aggregated only 1 tcp packet! total times TCP didn't aggregate or aggregated only one packet: %d \n", tcp_log_count);
-            fclose(logfile);
-        }*/
+        // if(args->dict_entry->dp_packet_buff1[1].packet == 0)
+        // {
+        //     tcp_log_count++;
+        //     logfile = fopen("/root/ovs/Aggregationstats.txt", "a+");
+        //     fprintf(logfile, "aggregated only 1 tcp packet! total times that TCP didn't aggregate or aggregated only one packet: %d \n", tcp_log_count);
+        //     fclose(logfile);
+        // }
         
         args->dict_entry->index = 0;
         struct eth_addr fake_mac = ETH_ADDR_C(12,34,56,78,9a,bc); //fake mac to distinguish Packet Aggregate
+        // struct eth_addr fake_mac1 = ETH_ADDR_C(11,11,11,11,11,11);
+        // struct eth_addr fake_mac2 = ETH_ADDR_C(22,22,22,22,22,22);
         //do stuff as if buffer were full
         char* a_p=NULL;
         char** buffer_data=&a_p;
-        struct dp_packet *packetAggr = create_custom_packet_aggr_tcp(args->dict_entry->dp_packet_buff1[0].packet, args->dict_entry->dp_packet_buff1, buffer_data);
+        uint32_t n=0;
+        //VLOG_ERR("thread break point 3");
+        struct dp_packet** packetAggr = create_custom_packet_aggr_tcp(&n,args->dict_entry->dp_packet_buff1[0].packet, args->dict_entry->dp_packet_buff1, buffer_data);
 
-        /* modify headers here if needed, remember to add parameters to this function */
-        //not sure if match on dl_src or dst works, POSSIBLE BUG HERE nothing too serious
-        struct eth_header *eth_hdrforAggr = dp_packet_eth(packetAggr);
-        eth_hdrforAggr->eth_src = fake_mac;
-        eth_hdrforAggr->eth_dst = fake_mac; //just added
+        //VLOG_ERR("Going to send aggr buffer with index by thread since timeout");
 
-        struct ip_header *iph = dp_packet_l3(packetAggr);
-        char *strip = "99.99.99.99";
-        ovs_be32 ip;
-        ip_parse(strip, &ip);
-        ovs_16aligned_be32 netip;
-        put_16aligned_be32(&netip, ip);
-        iph->ip_dst = netip;
+        struct eth_addr fake_mac_flow_id;
+        for(int z=0;z<6;z++){
+            fake_mac_flow_id.ea[z]=(uint8_t)(args->dict_entry->flow_id);
+        }
+
+        for(int j=0;j<n;j++){
+            /* modify headers here if needed, remember to add parameters to this function */
+            //not sure if match on dl_src or dst works, POSSIBLE BUG HERE nothing too serious
+            struct eth_header *eth_hdrforAggr = dp_packet_eth(packetAggr[j]);
+            // if(args->dict_entry->flow_id==1){
+            //     eth_hdrforAggr->eth_src = fake_mac1;
+            // }
+            // else if(args->dict_entry->flow_id==2){
+            //     eth_hdrforAggr->eth_src = fake_mac2;
+            // }
+            // else{
+            //     VLOG_ERR("wrong with flowid");
+            // }
+            //eth_hdrforAggr->eth_src = fake_mac;
+            eth_hdrforAggr->eth_src = fake_mac_flow_id;
+            eth_hdrforAggr->eth_dst = fake_mac;
+            // struct ip_header *iph = dp_packet_l3(packetAggr[j]);
+            // char strip[12] = "99.99.99.99";
+            // ovs_be32 ip;
+            // ip_parse(strip, &ip);
+            // ovs_16aligned_be32 netip;
+            // put_16aligned_be32(&netip, ip);
+            // iph->ip_dst = netip;
+            // iph->ip_src = netip;
+            //change the fake src ip according to the flow id of this aggr pk
+            //there could be a table which shows the relation between flow id and src/dst switch
+            //e.g. flow_id 1 ----> nw_src=00.00.00.01 nw_dst=00.00.00.02
+            //now we simplify it, nw_dst still 99.99.99.99, nw_src=00.00.00.flow_id
+            //char strip_src[12] = "00.00.00.00";
+            //char src=args->dict_entry->flow_id+'0';
+            //strip_src[10]=src;
+            //ovs_be32 ip_src;
+            //ip_parse(strip_src, &ip);
+            //ovs_16aligned_be32 netip;
+            //put_16aligned_be32(&netip, ip);
+            //iph->ip_src = netip;
+
+            int err_send = send_pkt_to_port(u16_to_ofp(args->aggrs->port), args->ofproto, packetAggr[j]);
+            if(err_send != 0) //VLOG_ERR("No.%d TCP Packet aggregation part sent correctly since timeout",j);
+            VLOG_ERR("Error in TCP packet aggregation delivery %d", err_send);
+            dp_packet_delete(packetAggr[j]);
+        }
+        free(packetAggr);
+        //VLOG_ERR("thread break point 4");
 
         //VLOG_ERR("structure of TCP AGGR packet before sending: %s ", ofp_dp_packet_to_string(packetAggr));
         //VLOG_ERR("Thread is sending TCP packet aggregation...");
 
-        
-        int err_send = send_pkt_to_port(u16_to_ofp(args->aggrs->port), args->ofproto, packetAggr);
-        if(err_send == 0) VLOG_ERR("TCP Packet aggregation sent correctly by Thread !");
-        else VLOG_ERR("Error in TCP packet aggregation delivery %d", err_send);
+        times_aggr_send++;
+        //VLOG_ERR("Now by thread, there has been %d sent aggr pks and %d have been deaggr",times_aggr_send,times_deaggr);
 
         /* dictionary cleanup */
         clear_packetBuff_tcp(args->dict_entry->dp_packet_buff1);
-        dp_packet_delete(packetAggr);
         free(*buffer_data);
-
+        //VLOG_ERR("thread break point 5");
         args->dict_entry->flow_id = 0;
         index_for_dict_tcp =  args->flow_entry_index;
         flows_in_dict_tcp--;
-        printf("No.%d paket has been sent on thread and cleared\n",number_aggrs);
+        //printf("No.%d paket has been sent on thread and cleared\n",number_aggrs);
+        //VLOG_ERR("thread break point 6");
     }
     else
     {
+
         tcp_log_count++;
-        logfile = fopen("/root/ovs/Aggregationstats.txt", "a+");
-        fprintf(logfile, "aggregated only 0 tcp packet! total times TCP didn't aggregate or aggregated only one packet: %d \n", tcp_log_count);
-        fclose(logfile);
-        VLOG_ERR("tcp timer stopped nothing sent buffer was empty");
+        //logfile = fopen("/root/ovs/Aggregationstats.txt", "a+");
+        //fprintf(logfile, "aggregated only 0 tcp packet! total times TCP didn't aggregate or aggregated only one packet: %d \n", tcp_log_count);
+        //fclose(logfile);
+        VLOG_ERR("Tcp timer stopped and buffer is empty, since the buffer has been sent by main thread");
     }
+    flag=pthread_mutex_unlock(&(args->dict_entry->mt));
+    if(flag!=0){
+        VLOG_ERR("thread unlock error with number %d",flag);
+    }
+    flag=pthread_mutex_destroy(&(args->dict_entry->mt));
+    if(flag!=0){
+        VLOG_ERR("destroy mutex error with number",flag);
+    }
+    args->dict_entry->flow_id=0;
+    //pthread_mutex_destroy(&args->dict_entry->mt);
 
 
     return 0; //or pthread_exit(args->dict_entry->tid);
@@ -5762,8 +5933,8 @@ check_flow_exists_tcp(struct flow_dict_tcp *fl_dict, int flowid)
     return -1;
 }
 /* This is a pseudo-dictionary, it has flow_ids as keys and buffers of my_captured_packet as the value along with other useful info explained in the struct definition */
-static struct flow_dict my_flow_dict[FLOWS_TO_HOLD] = {{0}};
-static struct flow_dict_tcp my_flow_dict_tcp[FLOWS_TO_HOLD] = {{0}};
+struct flow_dict my_flow_dict[FLOWS_TO_HOLD] = {{0}};
+struct flow_dict_tcp my_flow_dict_tcp[FLOWS_TO_HOLD] = {{0}};
 /*
  * function called by each aggregation flow to create and eventually send the aggregation of packets created
  * @ctx structure containing incoming packet as well as A LOT of other information
@@ -5772,6 +5943,7 @@ static struct flow_dict_tcp my_flow_dict_tcp[FLOWS_TO_HOLD] = {{0}};
  * @flow_entry_index needed for cleanup once aggregation is sent, Instead of iterating through all indexes of the dictionary,
  *                   the index for the next flow to be placed on is set to this value
  */
+
 static void
 compose_aggrs_action(struct xlate_ctx *ctx, struct dp_packet *packet_to_store,struct ofpact_aggrs *aggrs,  struct flow_dict *dict_entry, int flow_entry_index)
 {
@@ -5817,7 +5989,11 @@ compose_aggrs_action(struct xlate_ctx *ctx, struct dp_packet *packet_to_store,st
         put_16aligned_be32(&netip, ip);
         iph->ip_dst = netip;
         //VLOG_ERR("Sending packet aggregation...");
+        VLOG_ERR("Going to send since reach full");
         int err_send = send_pkt_to_port(u16_to_ofp(aggrs->port), ctx->xin->ofproto, packetAggr);
+        VLOG_ERR("This Aggrpacket is send through: %s ",  ofp_dp_packet_to_string(packetAggr));
+        times_aggr_send++;
+        VLOG_ERR("Now since full, there has been %d sent aggr pks and %d have been deaggr",times_aggr_send,times_deaggr);
 
         if(err_send == 0) VLOG_ERR("Packet aggregation sent correctly since buffer reached full capacity!");
         else VLOG_ERR("Error in packet aggregation delivery %d", err_send);
@@ -5840,84 +6016,144 @@ static void
 compose_aggrs_action_tcp(struct xlate_ctx *ctx,struct dp_packet *packet_to_store, struct ofpact_aggrs *aggrs,  struct flow_dict_tcp *dict_entry, int flow_entry_index)
 {
 
-    struct eth_addr fake_mac = ETH_ADDR_C(12,34,56,78,9a,bc); //fake mac to distinguish Packet Aggregate
-
+    //fake mac to distinguish Aggregatted Packet 
+    struct eth_addr fake_mac = ETH_ADDR_C(12,34,56,78,9a,bc); 
+    // struct eth_addr fake_mac1 = ETH_ADDR_C(11,11,11,11,11,11);
+    // struct eth_addr fake_mac2 = ETH_ADDR_C(22,22,22,22,22,22);
     
-    if(dict_entry->index < PACKET_BUFF_ELEMENTS && dict_entry->argsForThread.timerstop == false)
+    //the buffer still avaliable
+    if(dict_entry->index < PACKET_BUFF_ELEMENTS )
     {
-        VLOG_ERR("index: %d", dict_entry->index);
+        VLOG_ERR("Here comes a pk to aggr buffer with index %d",flow_entry_index);
         //struct dp_packet *packet_to_store = dp_packet_clone(ctx->xin->packet); //clone incoming packet
-        VLOG_ERR("structure of tcp packet added to buffer: %s ",  ofp_dp_packet_to_string(packet_to_store));
+        //VLOG_ERR("structure of tcp packet added to buffer: %s ",  ofp_dp_packet_to_string(packet_to_store));
         dict_entry->dp_packet_buff1[dict_entry->index].packet = packet_to_store;
         dict_entry->dp_packet_buff1[dict_entry->index].sizeoftcppayload = tcp_payload_length(packet_to_store);
         dict_entry->index++;
-        printf("No.%d paket has been aggregated\n",++number_aggrs);
+        //printf("No.%d paket has been aggregated\n",++number_aggrs);
+
+        //printing all info in the dp_packet struct
+        // VLOG_ERR("allocated_: %d",(int)(packet_to_store->allocated_));
+        // VLOG_ERR("data_ofs: %d",(int)packet_to_store->data_ofs);
+        // VLOG_ERR("size_: %d",(int)packet_to_store->size_);
+        // VLOG_ERR("ol_flags: %d",(int)packet_to_store->ol_flags);
+        // VLOG_ERR("rss_hash: %d",(int)packet_to_store->rss_hash);
+        // VLOG_ERR("flow_mark: %d",(int)packet_to_store->flow_mark);
+        // switch(packet_to_store->source){
+        //     case DPBUF_MALLOC : VLOG_ERR("source: DPBUF_MALLOC");break;
+        //     case DPBUF_STACK: VLOG_ERR("source: DPBUF_STACK");break;
+        //     case DPBUF_STUB: VLOG_ERR("source: DPBUF_STUB");break;
+        //     case DPBUF_DPDK: VLOG_ERR("source: DPBUF_DPDK");break;
+        //     case DPBUF_AFXDP: VLOG_ERR("source: DPBUF_AFXDP");
+        // }
+        // VLOG_ERR("l2_pad_size: %d",(int)packet_to_store->l2_pad_size);
+        // VLOG_ERR("l2_5_ofs: %d",(int)packet_to_store->l2_5_ofs);
+        // VLOG_ERR("l3_ofs: %d",(int)packet_to_store->l3_ofs);
+        // VLOG_ERR("l4_ofs: %d",(int)packet_to_store->l4_ofs);
+        // VLOG_ERR("cutlen: %d",(int)packet_to_store->cutlen);
+
     }
-    if(dict_entry->index == PACKET_BUFF_ELEMENTS && dict_entry->argsForThread.timerstop == false)
+    //buffer is full
+    if(dict_entry->index == PACKET_BUFF_ELEMENTS )
     {
         
         /*we don't need the thread anymore since buffer is full and ready to be sent, remove thread */
-        int err_thread = pthread_cancel(dict_entry->tid); //stop timer thread as it is not needed
-        VLOG_ERR("cancelled timer thread with errno: %d", err_thread);
+        //int err_thread = pthread_cancel(dict_entry->tid); //stop timer thread as it is not needed
+        //VLOG_ERR("cancelled timer thread with errno: %d", err_thread);
 
         dict_entry->index = 0; // ACTUALLY REMOVE PLACE IN ARRAY, don't think it's needed since check is done on flow id
 
+        VLOG_ERR("Going to send since %d buffer reaches full",flow_entry_index);
         /* create aggregation of packets to send */
         char* a_p=NULL;
         char** buffer_data=&a_p;
-        struct dp_packet *packetAggr = create_custom_packet_aggr_tcp(dict_entry->dp_packet_buff1[0].packet, dict_entry->dp_packet_buff1, buffer_data);
+        uint32_t n=0;
+        struct dp_packet** packetAggr = create_custom_packet_aggr_tcp(&n,dict_entry->dp_packet_buff1[0].packet, dict_entry->dp_packet_buff1, buffer_data);
 
-        /* modify headers here if needed, remember to add parameters to this function */
-        //not sure if match on dl_src or dst works, POSSIBLE BUG HERE nothing too serious
-        struct eth_header *eth_hdrforAggr = dp_packet_eth(packetAggr);
-        eth_hdrforAggr->eth_src = fake_mac;
-        eth_hdrforAggr->eth_dst = fake_mac;
-        struct ip_header *iph = dp_packet_l3(packetAggr);
-        char *strip = "99.99.99.99";
-        ovs_be32 ip;
-        ip_parse(strip, &ip);
-        ovs_16aligned_be32 netip;
-        put_16aligned_be32(&netip, ip);
-        iph->ip_dst = netip;
+        struct eth_addr fake_mac_flow_id;
+        for(int z=0;z<6;z++){
+            fake_mac_flow_id.ea[z]=(uint8_t)(dict_entry->flow_id);
+        }
+        //processing every parts of aggr pk
+        for(int j=0;j<n;j++){
+            /* modify headers here if needed, remember to add parameters to this function */
+            //not sure if match on dl_src or dst works, POSSIBLE BUG HERE nothing too serious
+            struct eth_header *eth_hdrforAggr = dp_packet_eth(packetAggr[j]);
+            // if(dict_entry->flow_id==1){
+            //     eth_hdrforAggr->eth_src = fake_mac1;
+            // }
+            // else if(dict_entry->flow_id==2){
+            //     eth_hdrforAggr->eth_src = fake_mac2;
+            // }
+            eth_hdrforAggr->eth_src = fake_mac_flow_id;
+            eth_hdrforAggr->eth_dst = fake_mac;
 
-        //VLOG_ERR("Sending TCP packet aggregation...");
-        int err_send = send_pkt_to_port(u16_to_ofp(aggrs->port), ctx->xin->ofproto, packetAggr);
-        //VLOG_ERR("structure of TCP AGGR packet before sending: %s ", ofp_dp_packet_to_string(packetAggr));
-        if(err_send == 0) VLOG_ERR("TCP Packet aggregation sent correctly since buffer reached full capacity!");
-        else VLOG_ERR("Error in TCP packet aggregation delivery %d", err_send);
+            // keep the original ip addr
+            // struct ip_header *iph = dp_packet_l3(packetAggr[j]);
+            // char *strip = "99.99.99.99";
+            // ovs_be32 ip;
+            // ip_parse(strip, &ip);
+            // ovs_16aligned_be32 netip;
+            // put_16aligned_be32(&netip, ip);
+            // iph->ip_dst = netip;
+            // iph->ip_src = netip;
 
-        VLOG_ERR("deleting buffer, zeroing flow_id and index of flow %d:", dict_entry->flow_id);
+            ;
+
+            int err_send = send_pkt_to_port(u16_to_ofp(aggrs->port), ctx->xin->ofproto, packetAggr[j]);
+            if(err_send != 0) //VLOG_ERR("No.%d TCP Packet aggregation part sent correctly since buffer reached full capacity!",j);
+            VLOG_ERR("Error in TCP packet aggregation delivery %d", err_send);
+            
+            dp_packet_delete(packetAggr[j]);
+        }
+        free(packetAggr);
+        
+
+        //int err_send = send_pkt_to_port(u16_to_ofp(aggrs->port), ctx->xin->ofproto, packetAggr);
+        //VLOG_ERR("This Aggrpacket is send through: %s ",  ofp_dp_packet_to_string(packetAggr));
+        times_aggr_send++;
+        //VLOG_ERR("Now since full, there has been %d sent aggr pks and %d have been deaggr",times_aggr_send,times_deaggr);
+        //VLOG_ERR("deleting buffer, zeroing flow_id and index of flow %d:", dict_entry->flow_id);
         //VLOG_ERR("sizeof dp_packet_buff %ld: ", sizeof(dict_entry->dp_packet_buff1));
         //VLOG_ERR("mysizeof dp_packet_buff %ld: ", PACKET_BUFF_ELEMENTS * sizeof(struct my_captured_packet_tcp));
 
+        //clear by 0
         clear_packetBuff_tcp(dict_entry->dp_packet_buff1);
-        dp_packet_delete(packetAggr);
         free(*buffer_data);
 
-        dict_entry->flow_id = 0;
+        //移动到thread中处理，作为是否被占用的标志
+        //dict_entry->flow_id = 0;
+        //dict_entry->filling_size=0;
         index_for_dict_tcp =  flow_entry_index;
         flows_in_dict_tcp--;
-        printf("No.%d paket has been sent and cleared since full",number_aggrs);
+        //printf("No.%d paket has been sent and cleared since full",number_aggrs);
+    }
+    int flag=pthread_mutex_unlock(&(dict_entry->mt));
+    if(flag!=0){
+        VLOG_ERR("main thread unlock error with number %d",flag);
     }
 
 }
 /*
  * function called when the flow corresponds to a deaggregation action
  */
+
+
 static void
 compose_deaggr(struct xlate_ctx *ctx)
 {
     struct eth_addr fake_mac = ETH_ADDR_C(12,34,56,78,9a,bc);
+    VLOG_ERR("Going to deaggr1 tcp");
 
-    VLOG_ERR("Going to deaggr1 udp");
     if(ctx->xin->packet)
     {
-        VLOG_ERR("Going to deaggr2 udp");
         struct eth_header *eth_preDeaggr = dp_packet_eth(ctx->xin->packet); //extract ETH header to check for aggregation dl_src
+        VLOG_ERR("Going to deaggr2 tcp");
 
         if(eth_addr_equals(eth_preDeaggr->eth_src, fake_mac))
         {
-            VLOG_ERR("Going to deaggr3 udp");
+            times_deaggr++;
+            VLOG_ERR("being deaggr,there has been %d sent aggr pks and %d have been deaggr",times_aggr_send,times_deaggr);
             //struct dp_packet *packet_to_store_forDeaggr = dp_packet_clone(ctx->xin->packet); //clone incoming packet
             char* checkrecvdAggr =(char*)dp_packet_get_udp_payload(ctx->xin->packet); //extract my_captured_packet array by casting the udp payload
             
@@ -5958,57 +6194,262 @@ compose_deaggr(struct xlate_ctx *ctx)
 static void
 compose_deaggr_tcp(struct xlate_ctx *ctx)
 {
-    struct eth_addr fake_mac = ETH_ADDR_C(12,34,56,78,9a,bc);
+    //struct eth_addr fake_mac = ETH_ADDR_C(12,34,56,78,9a,bc);
+    // struct eth_addr fake_mac1 = ETH_ADDR_C(11,11,11,11,11,11);
+    // struct eth_addr fake_mac2 = ETH_ADDR_C(22,22,22,22,22,22);
 
-    VLOG_ERR("Going to deaggr1 tcp");
-    if(ctx->xin->packet)
+    if(ctx->xin->packet!=NULL)
     {
-        VLOG_ERR("Going to deaggr2 tcp");
         struct eth_header *eth_preDeaggr = dp_packet_eth(ctx->xin->packet); //extract ETH header to check for aggregation dl_src
 
-        if(eth_addr_equals(eth_preDeaggr->eth_src, fake_mac))
+        //find the right deaggr buffer according to the eth_addr_src of coming pk
+        uint32_t flowId=(uint32_t)(eth_preDeaggr->eth_src.ea[0]);
+        // if(eth_addr_equals(eth_preDeaggr->eth_src, fake_mac1)){
+        //     flow_id_index=0;
+        // }
+        // else if(eth_addr_equals(eth_preDeaggr->eth_src, fake_mac2)){
+        //     flow_id_index=1;
+        // }
+
+        char* checkrecvdAggr =(char*)dp_packet_get_tcp_payload(ctx->xin->packet);
+
+        uint32_t flow_id_index=0;
+        uint32_t bufferId=0;
+        char* bufferId_ptr=(char*)&bufferId;
+        memcpy(bufferId_ptr,checkrecvdAggr,sizeof(uint32_t));
+        VLOG_ERR("This part with unique buffer id %d",bufferId);
+
+        uint32_t flag_bool=0;
+        for(int x=0;x<100;x++){
+            if(flow_deaggr_dict_tcp[x].flag==0)continue;
+            else{
+                if(flow_deaggr_dict_tcp[x].flow_id!=flowId)continue;
+                else if(flow_deaggr_dict_tcp[x].buffer_id==bufferId){
+                    flow_id_index=x;
+                    VLOG_ERR("The buffer already exist, with flow id %d and unique buffer id %d and index %d",flowId,bufferId,flow_id_index);
+                    flag_bool=1;
+                }
+                else continue;
+            }
+        }
+        if(flag_bool==0){
+            for(int x=0;x<100;x++){
+                if(flow_deaggr_dict_tcp[x].flag==0){
+                    flow_id_index=x;
+                    VLOG_ERR("First part of deaggr buffer, with flow id %d and unique buffer id %d and index %d",flowId,bufferId,flow_id_index);
+                    if(pthread_mutex_init(&flow_deaggr_dict_tcp[x].mt,NULL)!=0){
+                        VLOG_ERR("fail to init mutex in deaggr buffer");
+                    }
+                    else{
+                        VLOG_ERR("init mutex for %d dict and %d buffer correctly",x,bufferId);
+                    }
+                    break;
+                }
+            }
+        }
+
+        if(flow_deaggr_dict_tcp[flow_id_index].flag==0){
+            VLOG_ERR("This is the first part of deaggr buffer, with flow id %d",flowId);
+            flow_deaggr_dict_tcp[flow_id_index].flag=1;
+            flow_deaggr_dict_tcp[flow_id_index].buffer_id=bufferId;
+            flow_deaggr_dict_tcp[flow_id_index].flow_id=flowId;
+        } 
+
+        uint32_t seqNum=0;
+        char* seqNum_ptr=(char*)&seqNum;
+        memcpy(seqNum_ptr,checkrecvdAggr+4,sizeof(uint32_t));
+        VLOG_ERR("This part with sequence number %d",seqNum);
+
+        uint32_t len_pk=0;
+        char* len_pk_ptr=(char*)&len_pk;
+        memcpy(len_pk_ptr,checkrecvdAggr+8,sizeof(uint32_t));
+        //memcpy(flow_deaggr_dict_tcp[flow_id_index].pk_data,checkrecvdAggr+8,sizeof(uint32_t));
+        //flow_deaggr_dict_tcp[flow_id_index].cur_len+=4;
+        VLOG_ERR("The size of this part is %d",len_pk);
+
+        if(seqNum==1){
+            char* tar_len_ptr=(char*)&flow_deaggr_dict_tcp[flow_id_index].tar_len;
+            memcpy(tar_len_ptr,checkrecvdAggr+12,sizeof(uint32_t));
+            VLOG_ERR("The target size of this deaggr buffer is %d ",flow_deaggr_dict_tcp[flow_id_index].tar_len);
+            flow_deaggr_dict_tcp[flow_id_index].pk_data=malloc(flow_deaggr_dict_tcp[flow_id_index].tar_len);
+            flow_deaggr_dict_tcp[flow_id_index].pk_temp[seqNum]=malloc(len_pk);
+            memcpy(flow_deaggr_dict_tcp[flow_id_index].pk_temp[seqNum],checkrecvdAggr+16,len_pk);   
+            flow_deaggr_dict_tcp[flow_id_index].num_part=1;
+        }
+        else{
+            flow_deaggr_dict_tcp[flow_id_index].pk_temp[seqNum]=malloc(len_pk);
+            memcpy(flow_deaggr_dict_tcp[flow_id_index].pk_temp[seqNum],checkrecvdAggr+12,len_pk);
+            flow_deaggr_dict_tcp[flow_id_index].num_part++;
+        }
+        flow_deaggr_dict_tcp[flow_id_index].pk_len[seqNum]=len_pk;
+        //memcpy(flow_deaggr_dict_tcp[flow_id_index].pk_data+flow_deaggr_dict_tcp[flow_id_index].cur_len,checkrecvdAggr+12,len_pk);
+        flow_deaggr_dict_tcp[flow_id_index].cur_len+=len_pk;
+        //flow_deaggr_dict_tcp[flow_id_index].data_len+=len_pk;
+        VLOG_ERR("The current data size of deaggr buffer is %d",flow_deaggr_dict_tcp[flow_id_index].cur_len);
+
+        pthread_mutex_lock(&flow_deaggr_dict_tcp[flow_id_index].mt);
+        if(flow_deaggr_dict_tcp[flow_id_index].flag==1&&flow_deaggr_dict_tcp[flow_id_index].cur_len==flow_deaggr_dict_tcp[flow_id_index].tar_len)
         {
-            VLOG_ERR("Going to deaggr3 tcp");
+            VLOG_ERR("buffered all parts, going to deaggr, the buffer size is %d",flow_deaggr_dict_tcp[flow_id_index].tar_len);
+            int i=1;
+            int ans=0;
+            for(i;i<=flow_deaggr_dict_tcp[flow_id_index].num_part;i++){
+                memcpy(flow_deaggr_dict_tcp[flow_id_index].pk_data+ans,flow_deaggr_dict_tcp[flow_id_index].pk_temp[i],flow_deaggr_dict_tcp[flow_id_index].pk_len[i]);
+                VLOG_ERR("corruption?");
+                ans+=flow_deaggr_dict_tcp[flow_id_index].pk_len[i];
+                VLOG_ERR("going to free one temp_pk");
+                if(flow_deaggr_dict_tcp[flow_id_index].pk_temp[i]!=NULL){
+                    free(flow_deaggr_dict_tcp[flow_id_index].pk_temp[i]);
+                    flow_deaggr_dict_tcp[flow_id_index].pk_temp[i]=NULL;
+                }
+                VLOG_ERR("freed one temp_pk");
+                flow_deaggr_dict_tcp[flow_id_index].pk_len[i]=0;
+            }
+            VLOG_ERR("freed all temp_pk");
+
+            
             //struct dp_packet *packet_to_store_forDeaggr = dp_packet_clone(ctx->xin->packet); //clone incoming packet
             //struct my_captured_packet_tcp *checkrecvdAggr = (struct my_captured_packet_tcp *) dp_packet_get_tcp_payload(packet_to_store_forDeaggr); //extract my_captured_packet array by casting the udp payload
-            char* checkrecvdAggr =(char*)dp_packet_get_tcp_payload(ctx->xin->packet);
+            checkrecvdAggr =flow_deaggr_dict_tcp[flow_id_index].pk_data;
+            //char* checkrecvdAggr =(char*)malloc(ctx->xin->packet->size_);
+            //memcpy(checkrecvdAggr,ctx->xin->packet->base_+ctx->xin->packet->data_ofs,ctx->xin->packet->size_);
             /* for every packet in the array extract their flow and send it back to the flow table where they will be redirected accordingly */
             //bool bufferfull = true;
             //int j = 0; BREAKPOINT HERE !!!!
 
-            unsigned int buffer_size=ctx->xin->packet->size_-54;
-            VLOG_ERR("The size of payload of recieved aggr pk is %d",buffer_size);
-            struct dp_packet* temp_pk_for_deaggr=(struct dp_packet*)malloc(sizeof(struct dp_packet));
+            unsigned int buffer_size=flow_deaggr_dict_tcp[flow_id_index].cur_len;
+            //VLOG_ERR("The size of payload of recieved aggr pk is %d",buffer_size);
+            //VLOG_ERR("The size of checkrecvdAggr is %d",(int)sizeof(checkrecvdAggr));           
+            //uint32_t* size_pk_ptr;
             unsigned int offset_data=0;
+
+            //struct dp_packet* temp_for_flow=dp_packet_clone(ctx->xin->packet);
 
             while(buffer_size>offset_data) //instead of PACKET_BUFF_ELEMENTS just check if packet exists since it was initialized to 0
             {
-                memcpy(temp_pk_for_deaggr,checkrecvdAggr+offset_data,sizeof(struct dp_packet));
+                //memcpy(size_pk_ptr,checkrecvdAggr+offset_data,sizeof(uint32_t));
+                //uint32_t size_pk=*size_pk_ptr;
 
-                char* output_test_buffer=(char*)malloc(temp_pk_for_deaggr->allocated_);
-                memcpy(output_test_buffer,checkrecvdAggr+offset_data+sizeof(struct dp_packet),temp_pk_for_deaggr->allocated_);
-                VLOG_ERR("The one of payload of recieved aggr pk is %s",output_test_buffer);
-                int b=temp_pk_for_deaggr->allocated_;
-                VLOG_ERR("The size of one of recieved aggr pk is %d",b);
-                free(output_test_buffer);
+                uint32_t len_pk=0;
+                char* len_pk_ptr=(char*)&len_pk;
+                memcpy(len_pk_ptr,checkrecvdAggr+offset_data,sizeof(uint32_t));
+                offset_data+=4;
 
-                offset_data+=sizeof(struct dp_packet);
-                temp_pk_for_deaggr->base_=checkrecvdAggr+offset_data;
-                offset_data+=temp_pk_for_deaggr->allocated_;
-                int err_resub = resubmit_to_table(ctx,temp_pk_for_deaggr);
 
-                if(err_resub  == 0)
-                {
-                       VLOG_ERR("Deaggregation...Packet resubmitted to flow table successfully");
-                }
-                else VLOG_ERR("Deaggregation...Error in packet resubmission to flow table %d", err_resub);
+                // char* dp_point_temp=(char*)malloc(sizeof(struct dp_packet*));
+                // struct dp_packet* temp_pk_for_deaggr;
+                // memcpy(dp_point_temp,checkrecvdAggr+offset_data,sizeof(struct dp_packet*));
+                // temp_pk_for_deaggr=*(struct dp_packet**)dp_point_temp;
+                //struct dp_packet* dp_pk_pointer_delete=temp_pk_for_deaggr;
+                //char* deaggred_pk=(char*)malloc(temp_pk_for_deaggr->allocated_);
+                //memcpy(deaggred_pk,checkrecvdAggr+offset_data+sizeof(struct dp_packet*),temp_pk_for_deaggr->allocated_);
 
+                // offset_data+=sizeof(struct dp_packet*);
+                // temp_pk_for_deaggr->base_=checkrecvdAggr+offset_data;
+                // offset_data+=temp_pk_for_deaggr->allocated_;
+                // VLOG_ERR("The size of one of recieved aggr pk is %d",(int)temp_pk_for_deaggr->allocated_);
+                // send_pkt_to_port(2, ctx->xin->ofproto, temp_pk_for_deaggr);
+                
+                //int err_resub = resubmit_to_table(ctx,temp_pk_for_deaggr);
                 
 
+                // if(err_resub  == 0)
+                // {
+                //        VLOG_ERR("Deaggregation...Packet resubmitted to flow table successfully");
+                // }
+                // else VLOG_ERR("Deaggregation...Error in packet resubmission to flow table %d", err_resub);
+
+
+
+
+                //try to create dp_packet for every packet locally
+
+                struct dp_packet temp_pk;
+                temp_pk.base_=checkrecvdAggr+offset_data;
+                temp_pk.allocated_=len_pk;
+                //VLOG_ERR("The size of one recieved aagr pk is %d",(int)len_pk);
+                temp_pk.data_ofs=0;
+                temp_pk.size_=len_pk;
+                temp_pk.ol_flags=0; 
+                temp_pk.rss_hash=0;
+                temp_pk.flow_mark=0;
+                temp_pk.source=DPBUF_MALLOC;
+                temp_pk.l2_pad_size=0;
+                temp_pk.l2_5_ofs=65535;
+                temp_pk.l3_ofs=14;
+                uint8_t ip_header_len=0;
+                char* ip_header_len_ptr=(char*)&ip_header_len;
+                memcpy(ip_header_len_ptr,temp_pk.base_+14,1);
+                ip_header_len<<4;
+                ip_header_len>>4;
+                temp_pk.l4_ofs=14+ip_header_len;
+                //VLOG_ERR("ip header lenght is %d",(int)ip_header_len);
+                temp_pk.cutlen=0;
+                temp_pk.packet_type=htonl(PT_ETH);
+                memcpy(&temp_pk.md,&ctx->xin->packet->md,sizeof(struct dp_packet)-offsetof(struct dp_packet,md));
+                send_pkt_to_port(2, ctx->xin->ofproto, &temp_pk);
+                VLOG_ERR("deaggred one pk");
+                offset_data+=temp_pk.allocated_;
+
+
+                //dp_packet_delete(dp_pk_pointer_delete);
+                //free(dp_point_temp);
             }
-            free(temp_pk_for_deaggr);
+            VLOG_ERR("going to free whole buffer");
+            if(checkrecvdAggr!=NULL){
+                free(checkrecvdAggr);
+                checkrecvdAggr=NULL;
+            }
+            flow_deaggr_dict_tcp[flow_id_index].flag=0;
+            flow_deaggr_dict_tcp[flow_id_index].flow_id=0;
+            flow_deaggr_dict_tcp[flow_id_index].buffer_id=0;
+            flow_deaggr_dict_tcp[flow_id_index].tar_len=0;
+            flow_deaggr_dict_tcp[flow_id_index].cur_len=0;
+            flow_deaggr_dict_tcp[flow_id_index].pk_data=NULL;
+            flow_deaggr_dict_tcp[flow_id_index].num_part=0;
+            VLOG_ERR("freed whole buffer");
+            pthread_mutex_unlock(&flow_deaggr_dict_tcp[flow_id_index].mt);
+            VLOG_ERR("unlock mutex of this deaggr buffer");
 
         }
+        else if(flow_deaggr_dict_tcp[flow_id_index].flag==1&&flow_deaggr_dict_tcp[flow_id_index].cur_len>flow_deaggr_dict_tcp[flow_id_index].tar_len&&flow_deaggr_dict_tcp[flow_id_index].tar_len!=0){
+            //VLOG_ERR("Deaggr wrong since mac_addr not fit");
+            VLOG_ERR("buffered wrong pk!!!!!!");
+            VLOG_ERR("going to free every wrong pk!!!!!!");
+            int i=1;
+            for(i;i<=flow_deaggr_dict_tcp[flow_id_index].num_part;i++){
+                if(flow_deaggr_dict_tcp[flow_id_index].pk_temp[i]!=NULL){
+                    free(flow_deaggr_dict_tcp[flow_id_index].pk_temp[i]);
+                    flow_deaggr_dict_tcp[flow_id_index].pk_temp[i]=NULL;
+                }
+                flow_deaggr_dict_tcp[flow_id_index].pk_len[i]=0;
+            }
+            VLOG_ERR("freed all wrong pk!!!!!!");
+            flow_deaggr_dict_tcp[flow_id_index].flag=0;
+            flow_deaggr_dict_tcp[flow_id_index].flow_id=0;
+            flow_deaggr_dict_tcp[flow_id_index].buffer_id=0;
+            flow_deaggr_dict_tcp[flow_id_index].tar_len=0;
+            flow_deaggr_dict_tcp[flow_id_index].cur_len=0;
+            flow_deaggr_dict_tcp[flow_id_index].pk_data=NULL;
+            flow_deaggr_dict_tcp[flow_id_index].num_part=0;
+            pthread_mutex_unlock(&flow_deaggr_dict_tcp[flow_id_index].mt);
+            VLOG_ERR("unlock mutex of this deaggr buffer");
+
+        }
+        else if(flow_deaggr_dict_tcp[flow_id_index].flag==0){
+            VLOG_ERR("deaggr buffer has been freed");
+            pthread_mutex_unlock(&flow_deaggr_dict_tcp[flow_id_index].mt);
+            VLOG_ERR("unlock mutex of this deaggr buffer");
+        }
+        else{
+            VLOG_ERR("wating for other parts");
+            pthread_mutex_unlock(&flow_deaggr_dict_tcp[flow_id_index].mt);
+            VLOG_ERR("unlock mutex of this deaggr buffer");
+            
+        }
+    }
+    else{
+        VLOG_ERR("Deaggr wrong since ctx->xin->packet is null");
     }
 }
 /*
@@ -8522,47 +8963,81 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
                     /* tcp stuff
                      * */
                     struct dp_packet *packet = dp_packet_clone(ctx->xin->packet);
+                    //       
+                    // struct dp_packet *packet=(struct dp_packet*)malloc(sizeof(struct dp_packet));
+                    // memcpy(ctx->xin->packet,packet,sizeof(struct dp_packet));
+                    // //packet=(struct dp_packet*)packet;
+                    // void* dataXinPacket=malloc(packet->allocated_);
+                    // memcpy(packet->base_,dataXinPacket,packet->allocated_);
+                    // packet->base_=dataXinPacket;
+                    //
                     struct tcp_header *tcph = dp_packet_l4(packet);
                     uint32_t len = tcp_payload_length(packet);
                     int flags = TCP_FLAGS(tcph->tcp_ctl);
                     char *truepay = (char *) dp_packet_get_tcp_payload(packet);
                     if(ctx->xin->flow.nw_proto == 6) //if buffer of packets with given flowid exists
                     {
-                        VLOG_ERR("there are: %d TCP spots taken in array dict", flows_in_dict_tcp);
+                        //VLOG_ERR("there are: %d TCP spots taken in array dict", flows_in_dict_tcp);
                         int fl_entry_index_tcp = check_flow_exists_tcp(my_flow_dict_tcp, aggrs->flowid);
-                        ////flow normally: tls handshake(all messages),acks w/len 0, acks and psh|acks wlen 1420(reassembled pdus), rst
+                        //flow normally: tls handshake(all messages),acks w/len 0, acks and psh|acks wlen 1420(reassembled pdus), rst
                         if(len == 0 || flags == 25 || flags == 20 || truepay[0] == 22 || truepay[0] == 20
                                || ((flags == 16 || flags ==24) && len == 1420))
                         {
-                            VLOG_ERR("structure of ack packet sending through: %s ",  ofp_dp_packet_to_string(packet));
+                            //VLOG_ERR("structure of ack packet sending through: %s ",  ofp_dp_packet_to_string(packet));
+                            //VLOG_ERR("length of ack packet is: %d ",  packet->allocated_);
                             //VLOG_INFO("syn,ack,syn-ack or fin-psh-ack caught, sending through without aggregation");
                             send_pkt_to_port(u16_to_ofp(aggrs->port), ctx->xin->ofproto, packet);
-                            break; //do i need this
+                            //pthread_t tid_test;
+                            //pthread_create(&tid_test,NULL,thread_test_proc,NULL);
+                            //pthread_detach(tid_test);
+                            //break; //do i need this
                         }
-                        if(fl_entry_index_tcp >=0) //if unfilled buffer exists
+                        //when current buffer not enough, create a new one.
+                        else if(fl_entry_index_tcp >=0 &&my_flow_dict_tcp[fl_entry_index_tcp].flow_id!=0&&pthread_mutex_trylock(&my_flow_dict_tcp[fl_entry_index_tcp].mt)==0) 
                         {
-
+                            //VLOG_ERR("index_tcp>=0");
+                            //dp_pcket指针和真实数据长度
+                            //my_flow_dict_tcp[fl_entry_index_tcp].filling_size+=packet->allocated_+sizeof(struct dp_packet*);
                             compose_aggrs_action_tcp(ctx, packet, aggrs, &my_flow_dict_tcp[fl_entry_index_tcp], fl_entry_index_tcp);
+                            VLOG_ERR("The target aggr buffer already exist with index %d",fl_entry_index_tcp);    
+                        
                         }
-                        if(fl_entry_index_tcp == -1 && flows_in_dict_tcp < FLOWS_TO_HOLD && ctx->xin->flow.nw_proto == 6)
-                        {
+                        else if((fl_entry_index_tcp == -1 && flows_in_dict_tcp < FLOWS_TO_HOLD)||fl_entry_index_tcp>=0)
+                        {   
 
-                            VLOG_ERR("new TCP flow that requires aggregation found with flowid: %d"
-                                     "creating entry in dictionary...", aggrs->flowid);
+                            //if(fl_entry_index_tcp >=0&&(my_flow_dict_tcp[fl_entry_index_tcp].flow_id==0||pthread_mutex_trylock(&my_flow_dict_tcp[fl_entry_index_tcp].mt)==EBUSY)){
+                            if(fl_entry_index_tcp >=0){
+                                VLOG_ERR("This aggr buffer has been occupied, let's create a new one");
+                            }
+                            
                             while(my_flow_dict_tcp[index_for_dict_tcp].flow_id !=0 && index_for_dict_tcp < FLOWS_TO_HOLD )
                             {
-                                VLOG_ERR("looking for first available space in dictionary of flows ...");
+                                //VLOG_ERR("looking for first available space in dictionary of flows ...");
                                 index_for_dict_tcp++;
                             }
                             if(index_for_dict_tcp >= FLOWS_TO_HOLD)
                             {
                                 VLOG_ERR("TCP dictionary of flows full, check FLOWS_TO_HOLD number of flows ...\n"
                                          "maybe consider splitting instead");
+
                             }
                             else
                             {
-                                VLOG_ERR("placing first TCP packet in the array at dict index: %d", index_for_dict_tcp);
-                                my_flow_dict_tcp[index_for_dict_tcp].flow_id = aggrs->flowid;
+                                VLOG_ERR("Placing first TCP packet in a new array at dict index: %d", index_for_dict_tcp);
+                                if(my_flow_dict_tcp[index_for_dict_tcp].flow_id==0){
+                                    my_flow_dict_tcp[index_for_dict_tcp].flow_id = aggrs->flowid;
+                                }
+                                else{
+                                    while(my_flow_dict_tcp[index_for_dict_tcp].flow_id !=0 && index_for_dict_tcp < FLOWS_TO_HOLD )
+                                    {
+                                        //VLOG_ERR("looking for first available space in dictionary of flows ...");
+                                        index_for_dict_tcp++;
+                                    }
+                                    my_flow_dict_tcp[index_for_dict_tcp].flow_id = aggrs->flowid;
+                                } 
+                                    
+                                //长度信息4byte和真实数据长度
+                                //my_flow_dict_tcp[index_for_dict_tcp].filling_size+=packet->allocated_+sizeof(struct dp_packet*);
                                 //hold_to_rebuild[i_removed].to_reassemble = malloc(s_pkt.tot_splits * sizeof(struct my_split_packet));
                                 my_flow_dict_tcp[index_for_dict_tcp].index = 0;
                                 //my_flow_dict[index_for_dict].buffer_full = false;
@@ -8573,12 +9048,30 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
                                 my_flow_dict_tcp[index_for_dict_tcp].argsForThread.dict_entry = &my_flow_dict_tcp[index_for_dict_tcp];
                                 my_flow_dict_tcp[index_for_dict_tcp].argsForThread.aggrs = aggrs;
                                 my_flow_dict_tcp[index_for_dict_tcp].argsForThread.ofproto = ctx->xin->ofproto;
-                                pthread_create(&my_flow_dict_tcp[index_for_dict_tcp].tid, NULL, threadproc_tcp,  (void *)&my_flow_dict_tcp[index_for_dict_tcp].argsForThread);
+                                if(pthread_mutex_init(&my_flow_dict_tcp[index_for_dict_tcp].mt,NULL)!=0){
+                                    VLOG_ERR("fail to init mutex");
+                                }
+                                else{
+                                    VLOG_ERR("init mutex of %d dict correctly",index_for_dict_tcp);
+                                }
                                 //VLOG_ERR("entered compose tcp");
+                                if(pthread_mutex_lock(&my_flow_dict_tcp[index_for_dict_tcp].mt)!=0){
+                                    VLOG_ERR("mt lock error when new aggr buffer");
+                                }
+                                else{
+                                    VLOG_ERR("mt lock correctly when new aggr buffer");
+                                }
                                 compose_aggrs_action_tcp(ctx, packet, aggrs, &my_flow_dict_tcp[index_for_dict_tcp], index_for_dict_tcp);
+                                //int test_index=index_for_dict_tcp;
+                                pthread_create(&my_flow_dict_tcp[index_for_dict_tcp].tid, NULL, threadproc_tcp,  (void *)&my_flow_dict_tcp[index_for_dict_tcp].argsForThread);
+                                pthread_detach(my_flow_dict_tcp[index_for_dict_tcp].tid);
+                                //pthread_join(my_flow_dict_tcp[index_for_dict_tcp].tid,NULL);
 
                             }
 
+                        }
+                        else{
+                            VLOG_ERR("wrong with aggr action");
                         }
 
                     }
@@ -8639,12 +9132,18 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
                 ctx->xout->slow |= SLOW_ACTION;
 
                 if(ctx->xin->flow.nw_proto == 6)
-                {
+                {   
+                    VLOG_ERR("Deaggr function will be triggered for %d times",going_in_deaggr++);
                     compose_deaggr_tcp(ctx);
                 }
-                if(ctx->xin->flow.nw_proto == 17)
+                else if(ctx->xin->flow.nw_proto == 17)
                 {
+                    VLOG_ERR("Deaggr function will be triggered for %d times",going_in_deaggr++);
                     compose_deaggr(ctx);
+                }
+                else{
+                    VLOG_ERR("Deaggr function will be triggered for %d times",going_in_deaggr++);
+                    compose_deaggr_tcp(ctx);
                 }
                 break;
             }
@@ -9577,6 +10076,7 @@ xlate_send_packet(const struct ofport_dpif *ofport, bool oam,
     }
 
     ofpact_put_OUTPUT(&ofpacts)->port = xport->ofp_port;
+    VLOG_ERR("In function xlate_send_packet,ofpacts.size:%d,packetsize:%d",ofpacts.size,packet->allocated_);
 
     /* Actions here are not referring to anything versionable (flow tables or
      * groups) so we don't need to worry about the version here. */
